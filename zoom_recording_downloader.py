@@ -83,7 +83,7 @@ ACCOUNT_ID = config("OAuth", "account_id", LookupError)
 CLIENT_ID = config("OAuth", "client_id", LookupError)
 CLIENT_SECRET = config("OAuth", "client_secret", LookupError)
 
-APP_VERSION = "3.1.4 (Google Drive Edition)"
+APP_VERSION = "3.1.5 (Google Drive Edition)"
 
 API_ENDPOINT_USER_LIST = "https://api.zoom.us/v2/users"
 
@@ -356,21 +356,86 @@ def handle_graceful_shutdown(signal_received, frame):
 
     system.exit(0)
 
-def delete_meeting_recordings(meeting_id: str):
-    """Delete all cloud recordings for a given meeting ID."""
+def delete_meeting_recordings(meeting_id: str, recording_ids: list = None):
+    """Delete all cloud recordings for a given meeting ID.
+    
+    If meeting-level deletion fails with permission error (code 4711),
+    attempt to delete each recording file individually.
+    
+    Args:
+        meeting_id: The Zoom meeting ID
+        recording_ids: List of individual recording file IDs (for fallback)
+    
+    Returns:
+        True if deletion succeeded, False otherwise.
+        Exits the process if permission errors persist.
+    """
     if DRY_RUN:
         print(f"{Color.CYAN}    [DRY-RUN] Would delete all cloud recordings for MeetingID {meeting_id}{Color.END}")
         return True
 
     url = f"https://api.zoom.us/v2/meetings/{meeting_id}/recordings"
     resp = requests.delete(url=url, headers=AUTHORIZATION_HEADER)
+    
     if resp.ok:
         print(f"{Color.GREEN}### Deleted all cloud recordings for MeetingID {meeting_id}{Color.END}")
         return True
-    else:
-        print(f"{Color.RED}### Failed to delete cloud recordings for MeetingID {meeting_id}: "
-              f"{resp.status_code} {resp.text}{Color.END}")
-        return False
+    
+    # Check for permission error 4711 and attempt individual deletion
+    try:
+        error_data = resp.json()
+        if error_data.get("code") == 4711 and recording_ids:
+            print(f"{Color.YELLOW}### Meeting-level deletion failed (permission error), trying individual file deletion...{Color.END}")
+            return delete_individual_recordings(meeting_id, recording_ids)
+    except (json.JSONDecodeError, KeyError):
+        pass
+    
+    print(f"{Color.RED}### Failed to delete cloud recordings for MeetingID {meeting_id}: "
+          f"{resp.status_code} {resp.text}{Color.END}")
+    return False
+
+
+def delete_individual_recordings(meeting_id: str, recording_ids: list):
+    """Delete recording files individually.
+    
+    Args:
+        meeting_id: The Zoom meeting ID
+        recording_ids: List of individual recording file IDs
+    
+    Returns:
+        True if all deletions succeeded, False otherwise.
+        Exits the process if permission errors persist.
+    """
+    all_deleted = True
+    
+    for rec_id in recording_ids:
+        if DRY_RUN:
+            print(f"{Color.CYAN}    [DRY-RUN] Would delete recording {rec_id}{Color.END}")
+            continue
+        
+        url = f"https://api.zoom.us/v2/meetings/{meeting_id}/recordings/{rec_id}"
+        resp = requests.delete(url=url, headers=AUTHORIZATION_HEADER)
+        
+        if resp.ok:
+            print(f"{Color.GREEN}    > Deleted recording file {rec_id}{Color.END}")
+        else:
+            # Check for permission error
+            try:
+                error_data = resp.json()
+                if error_data.get("code") == 4711:
+                    print(f"{Color.RED}### Permission denied for deleting recordings.{Color.END}")
+                    print(f"{Color.RED}### Please update your Zoom app scopes to include:{Color.END}")
+                    print(f"{Color.RED}###   - cloud_recording:delete:meeting_recording:admin{Color.END}")
+                    print(f"{Color.RED}###   - cloud_recording:delete:meeting_recording{Color.END}")
+                    print(f"{Color.RED}### Exiting...{Color.END}")
+                    system.exit(1)
+            except (json.JSONDecodeError, KeyError):
+                pass
+            
+            print(f"{Color.RED}    > Failed to delete recording file {rec_id}: {resp.status_code}{Color.END}")
+            all_deleted = False
+    
+    return all_deleted
 
 def log(message):
     with open(COMPLETED_MEETING_IDS_LOG, 'a') as log_file:
@@ -483,12 +548,13 @@ def main():
             print(f"\n==> Processing recording {index + 1} of {total_count}")
 
             all_downloads_successful = True
-            for file_type, file_extension, download_url, recording_type, recording_id in downloads:
+            downloaded_recording_ids = []
+            for file_type, file_extension, download_url, recording_type, file_recording_id in downloads:
                 try:
                     params = {
                         "file_extension": file_extension,
                         "recording": recording,
-                        "recording_id": recording_id,
+                        "recording_id": file_recording_id,
                         "recording_type": recording_type
                     }
                     filename, folder_name = format_filename(params)
@@ -513,10 +579,11 @@ def main():
                                         os.rmdir(sanitized_download_dir)
                         
                         if VERBOSE_URL:
-                            log(f"** Downloaded {recording_id} from \n\t{download_url}\n\t to {full_filename}\n")
+                            log(f"** Downloaded {file_recording_id} from \n\t{download_url}\n\t to {full_filename}\n")
                         else:
-                            log(f"** Downloaded {recording_id} to {full_filename}\n")
-                        COMPLETED_MEETING_IDS.add(recording_id)
+                            log(f"** Downloaded {file_recording_id} to {full_filename}\n")
+                        COMPLETED_MEETING_IDS.add(file_recording_id)
+                        downloaded_recording_ids.append(file_recording_id)
                     else:
                         all_downloads_successful = False
 
@@ -531,7 +598,7 @@ def main():
 
             # Delete meeting recordings only after all files downloaded successfully
             if DELETE_AFTER_DOWNLOAD and all_downloads_successful:
-                if delete_meeting_recordings(meeting_id):
+                if delete_meeting_recordings(meeting_id, downloaded_recording_ids):
                     log(f"** >> Deleted all recordings for MeetingID {meeting_id} - {start_time} - {topic} - {duration} from Zoom cloud\n")
             elif DELETE_AFTER_DOWNLOAD and not all_downloads_successful:
                 print(f"{Color.YELLOW}### Skipping deletion for MeetingID {meeting_id} - not all files downloaded successfully{Color.END}")
