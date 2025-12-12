@@ -350,15 +350,17 @@ def handle_graceful_shutdown(signal_received, frame):
 
     system.exit(0)
 
-def delete_recording(meeting_id: str, recording_id: str):
-    """Delete the cloud recording for a given meeting ID."""
-    url = f"https://api.zoom.us/v2/meetings/{meeting_id}/recordings/{recording_id}"
+def delete_meeting_recordings(meeting_id: str):
+    """Delete all cloud recordings for a given meeting ID."""
+    url = f"https://api.zoom.us/v2/meetings/{meeting_id}/recordings"
     resp = requests.delete(url=url, headers=AUTHORIZATION_HEADER)
     if resp.ok:
-        print(f"{Color.GREEN}### Deleted cloud recording RecordingID {recording_id} for MeetingID {meeting_id}{Color.END}")
+        print(f"{Color.GREEN}### Deleted all cloud recordings for MeetingID {meeting_id}{Color.END}")
+        return True
     else:
-        print(f"{Color.RED}### Failed to delete cloud recording {recording_id} for MeetingID {meeting_id}: "
+        print(f"{Color.RED}### Failed to delete cloud recordings for MeetingID {meeting_id}: "
               f"{resp.status_code} {resp.text}{Color.END}")
+        return False
 
 def log(message):
     with open(COMPLETED_MEETING_IDS_LOG, 'a') as log_file:
@@ -458,6 +460,7 @@ def main():
 
             print(f"\n==> Processing recording {index + 1} of {total_count}")
 
+            all_downloads_successful = True
             for file_type, file_extension, download_url, recording_type, recording_id in downloads:
                 try:
                     params = {
@@ -483,6 +486,14 @@ def main():
                                 os.remove(full_filename)
                                 if not os.listdir(sanitized_download_dir):
                                     os.rmdir(sanitized_download_dir)
+                        
+                        if VERBOSE_URL:
+                            log(f"** Downloaded {recording_id} from \n\t{download_url}\n\t to {full_filename}\n")
+                        else:
+                            log(f"** Downloaded {recording_id} to {full_filename}\n")
+                        COMPLETED_MEETING_IDS.add(recording_id)
+                    else:
+                        all_downloads_successful = False
 
                 except Exception as e:
                     print(
@@ -490,17 +501,15 @@ def main():
                         f"for recording {index + 1} of {total_count} due to error: "
                         f"{str(e)}{Color.END}"
                     )
-                    continue                
+                    all_downloads_successful = False
+                    continue
 
-                if VERBOSE_URL:
-                    log(f"** Downloaded {recording_id} from \n\t{download_url}\n\t to {full_filename}\n")
-                else:
-                    log(f"** Downloaded {recording_id} to {full_filename}\n")
-                COMPLETED_MEETING_IDS.add(recording_id)
-                
-                if DELETE_AFTER_DOWNLOAD:
-                    delete_recording(meeting_id,recording_id)
-                    log(f"** >> Deleted recording {meeting_id,recording_id} - {start_time} - {topic} - {duration} Zoom cloud\n")
+            # Delete meeting recordings only after all files downloaded successfully
+            if DELETE_AFTER_DOWNLOAD and all_downloads_successful:
+                if delete_meeting_recordings(meeting_id):
+                    log(f"** >> Deleted all recordings for MeetingID {meeting_id} - {start_time} - {topic} - {duration} from Zoom cloud\n")
+            elif DELETE_AFTER_DOWNLOAD and not all_downloads_successful:
+                print(f"{Color.YELLOW}### Skipping deletion for MeetingID {meeting_id} - not all files downloaded successfully{Color.END}")
                     
 
 
