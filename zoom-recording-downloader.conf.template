@@ -6,6 +6,8 @@
     },
     "_comment": "everything after this is optional",
     "Storage": {
+        "storage_method": "prompt",
+        "dry_run": false,
         "completed_log": "completed-downloads.log",
         "verbose_url": false,
         "download_dir": "downloads",

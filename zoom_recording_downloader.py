@@ -83,7 +83,7 @@ ACCOUNT_ID = config("OAuth", "account_id", LookupError)
 CLIENT_ID = config("OAuth", "client_id", LookupError)
 CLIENT_SECRET = config("OAuth", "client_secret", LookupError)
 
-APP_VERSION = "3.1.2 (Google Drive Edition)"
+APP_VERSION = "3.1.4 (Google Drive Edition)"
 
 API_ENDPOINT_USER_LIST = "https://api.zoom.us/v2/users"
 
@@ -95,6 +95,8 @@ RECORDING_END_DATE = parser.parse(config("Recordings", "end_date", str(date.toda
 DOWNLOAD_DIRECTORY = config("Storage", "download_dir", 'downloads')
 COMPLETED_MEETING_IDS_LOG = config("Storage", "completed_log", 'completed-downloads.log')
 VERBOSE_URL = config("Storage", "verbose_url", False)
+STORAGE_METHOD = config("Storage", "storage_method", 'prompt')
+DRY_RUN = config("Storage", "dry_run", False)
 COMPLETED_MEETING_IDS = set()
 
 MEETING_TIMEZONE = ZoneInfo(config("Recordings", "timezone", 'UTC'))
@@ -305,6 +307,10 @@ def download_recording(download_url, email, filename, folder_name):
     sanitized_filename = path_validate.sanitize_filename(filename)
     full_filename = os.sep.join([sanitized_download_dir, sanitized_filename])
 
+    if DRY_RUN:
+        print(f"{Color.CYAN}    [DRY-RUN] Would download: {filename} to {folder_name}{Color.END}")
+        return True
+
     os.makedirs(sanitized_download_dir, exist_ok=True)
 
     response = requests.get(download_url, stream=True)
@@ -352,6 +358,10 @@ def handle_graceful_shutdown(signal_received, frame):
 
 def delete_meeting_recordings(meeting_id: str):
     """Delete all cloud recordings for a given meeting ID."""
+    if DRY_RUN:
+        print(f"{Color.CYAN}    [DRY-RUN] Would delete all cloud recordings for MeetingID {meeting_id}{Color.END}")
+        return True
+
     url = f"https://api.zoom.us/v2/meetings/{meeting_id}/recordings"
     resp = requests.delete(url=url, headers=AUTHORIZATION_HEADER)
     if resp.ok:
@@ -403,20 +413,32 @@ def main():
         {Color.END}
     """)
 
-    # Storage choice prompt
-    print("\nChoose download method:")
-    print("1. Local Storage")
-    print("2. Google Drive")
-    choice = input("Enter choice (1-2): ")
-
+    # Storage method selection
     global GDRIVE_ENABLED
-    GDRIVE_ENABLED = (choice == "2")
-
     drive_service = None
-    if GDRIVE_ENABLED:
+
+    if DRY_RUN:
+        print(f"{Color.CYAN}### DRY-RUN MODE ENABLED - No files will be downloaded or deleted{Color.END}\n")
+
+    if STORAGE_METHOD == "local":
+        print(f"Storage method: Local Storage (from config)")
+        GDRIVE_ENABLED = False
+    elif STORAGE_METHOD == "google_drive":
+        print(f"Storage method: Google Drive (from config)")
+        GDRIVE_ENABLED = True
         drive_service = setup_google_drive()
         if not drive_service:
             GDRIVE_ENABLED = False
+    else:  # "prompt" or any other value
+        print("\nChoose download method:")
+        print("1. Local Storage")
+        print("2. Google Drive")
+        choice = input("Enter choice (1-2): ")
+        GDRIVE_ENABLED = (choice == "2")
+        if GDRIVE_ENABLED:
+            drive_service = setup_google_drive()
+            if not drive_service:
+                GDRIVE_ENABLED = False
 
     load_access_token()
     load_completed_meeting_ids()
@@ -480,12 +502,15 @@ def main():
 
                     if download_recording(download_url, email, filename, folder_name):
                         if GDRIVE_ENABLED and drive_service:
-                            print(f"    > Uploading to Google Drive...")
-                            success = drive_service.upload_file(full_filename, folder_name, sanitized_filename)
-                            if success and os.path.exists(full_filename):
-                                os.remove(full_filename)
-                                if not os.listdir(sanitized_download_dir):
-                                    os.rmdir(sanitized_download_dir)
+                            if DRY_RUN:
+                                print(f"{Color.CYAN}    [DRY-RUN] Would upload to Google Drive: {sanitized_filename}{Color.END}")
+                            else:
+                                print(f"    > Uploading to Google Drive...")
+                                success = drive_service.upload_file(full_filename, folder_name, sanitized_filename)
+                                if success and os.path.exists(full_filename):
+                                    os.remove(full_filename)
+                                    if not os.listdir(sanitized_download_dir):
+                                        os.rmdir(sanitized_download_dir)
                         
                         if VERBOSE_URL:
                             log(f"** Downloaded {recording_id} from \n\t{download_url}\n\t to {full_filename}\n")
