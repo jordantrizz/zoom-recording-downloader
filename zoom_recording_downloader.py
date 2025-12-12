@@ -40,17 +40,30 @@ class Color:
     UNDERLINE = "\033[4m"
     END = "\033[0m"
 
-CONF_PATH = "zoom-recording-downloader.conf"
+# Get the directory where the script is located
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+CONF_PATH = os.path.join(SCRIPT_DIR, "zoom-recording-downloader.conf")
+CONF_TEMPLATE_PATH = os.path.join(SCRIPT_DIR, "zoom-recording-downloader.conf.template")
 
 # Load configuration file and check for proper JSON syntax
 try:
     with open(CONF_PATH, encoding="utf-8-sig") as json_file:
         CONF = json.loads(json_file.read())
+    print(f"{Color.GREEN}### Configuration file found: {CONF_PATH}{Color.END}")
 except json.JSONDecodeError as e:
     print(f"{Color.RED}### Error parsing JSON in {CONF_PATH}: {e}")
     system.exit(1)
 except FileNotFoundError:
-    print(f"{Color.RED}### Configuqration file {CONF_PATH} not found")
+    print(f"{Color.YELLOW}### Configuration file {CONF_PATH} not found, doing automatic setup...")
+    try:
+        import shutil
+        shutil.copy(CONF_TEMPLATE_PATH, CONF_PATH)
+        print(f"{Color.GREEN}### Created {CONF_PATH} from template.")
+        print(f"{Color.YELLOW}### Please edit {CONF_PATH} and add your Zoom OAuth credentials, then run again.{Color.END}")
+    except FileNotFoundError:
+        print(f"{Color.RED}### Template file {CONF_TEMPLATE_PATH} not found. Cannot create config file.{Color.END}")
+    except Exception as e:
+        print(f"{Color.RED}### Failed to create config file: {e}{Color.END}")
     system.exit(1)
 except Exception as e:
     print(f"{Color.RED}### Unexpected error: {e}")
@@ -70,7 +83,7 @@ ACCOUNT_ID = config("OAuth", "account_id", LookupError)
 CLIENT_ID = config("OAuth", "client_id", LookupError)
 CLIENT_SECRET = config("OAuth", "client_secret", LookupError)
 
-APP_VERSION = "3.1 (Google Drive Edition)"
+APP_VERSION = "3.1.2 (Google Drive Edition)"
 
 API_ENDPOINT_USER_LIST = "https://api.zoom.us/v2/users"
 
