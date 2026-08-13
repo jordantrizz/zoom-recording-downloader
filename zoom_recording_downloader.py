@@ -11,14 +11,30 @@
 # Forked from:  https://gist.github.com/danaspiegel/c33004e52ffacb60c24215abf8301680
 
 # System modules
+import argparse
 import base64
 import json
 import os
 import re as regex
+import shutil
 import signal
+import subprocess
 import sys as system
 import time
 from datetime import datetime, date, timezone, timedelta
+from urllib.parse import quote
+
+ARGS_PARSER = argparse.ArgumentParser(
+    prog="zoom-recording-downloader",
+    description="Download and organize Zoom cloud recordings to local storage or Google Drive.",
+)
+ARGS_PARSER.add_argument(
+    "--skip-delete",
+    action="store_true",
+    help="Keep recordings in the Zoom cloud after download "
+         "(overrides delete_after_download=true in the config).",
+)
+ARGS = ARGS_PARSER.parse_args()
 
 # Installed modules
 import dateutil.parser as parser
@@ -49,14 +65,13 @@ CONF_TEMPLATE_PATH = os.path.join(SCRIPT_DIR, "zoom-recording-downloader.conf.te
 try:
     with open(CONF_PATH, encoding="utf-8-sig") as json_file:
         CONF = json.loads(json_file.read())
-    print(f"{Color.GREEN}### Configuration file found: {CONF_PATH}{Color.END}")
+    print(f"{Color.GREEN}### Loading from {CONF_PATH}{Color.END}")
 except json.JSONDecodeError as e:
     print(f"{Color.RED}### Error parsing JSON in {CONF_PATH}: {e}")
     system.exit(1)
 except FileNotFoundError:
     print(f"{Color.YELLOW}### Configuration file {CONF_PATH} not found, doing automatic setup...")
     try:
-        import shutil
         shutil.copy(CONF_TEMPLATE_PATH, CONF_PATH)
         print(f"{Color.GREEN}### Created {CONF_PATH} from template.")
         print(f"{Color.YELLOW}### Please edit {CONF_PATH} and add your Zoom OAuth credentials, then run again.{Color.END}")
@@ -83,7 +98,7 @@ ACCOUNT_ID = config("OAuth", "account_id", LookupError)
 CLIENT_ID = config("OAuth", "client_id", LookupError)
 CLIENT_SECRET = config("OAuth", "client_secret", LookupError)
 
-APP_VERSION = "3.1.5 (Google Drive Edition)"
+APP_VERSION = "3.2.0 (Google Drive Edition)"
 
 API_ENDPOINT_USER_LIST = "https://api.zoom.us/v2/users"
 
@@ -113,7 +128,10 @@ GDRIVE_MAX_RETRIES = int(config("GoogleDrive", "max_retries", "3"))
 GDRIVE_FAILED_LOG = config("GoogleDrive", "failed_log", "failed-uploads.log")
 
 # new: should we delete Zoom cloud recordings once downloaded?
-DELETE_AFTER_DOWNLOAD = config("Storage", "delete_after_download", False)
+DELETE_AFTER_DOWNLOAD = config("Storage", "delete_after_download", False) and not ARGS.skip_delete
+
+# verify downloaded files have content and are not corrupt
+VERIFY_DOWNLOADS = config("Storage", "verify_downloads", True)
 
 ACCESS_TOKEN = None
 AUTHORIZATION_HEADER = {}
@@ -301,6 +319,68 @@ def list_recordings(email):
     return recordings
 
 
+MEDIA_EXTENSIONS = {"mp4", "m4a", "mov", "avi", "wmv", "webm", "mkv", "mp3", "wav", "flv"}
+
+
+def verify_downloaded_file(full_filename, expected_size):
+    """ Verify that a downloaded file has content and is not corrupt.
+
+    Checks that the file exists and is non-empty, matches the expected
+    size when known, and (for media files) decodes cleanly with ffmpeg.
+
+    Args:
+        full_filename: Absolute path to the downloaded file.
+        expected_size: Expected size in bytes from the content-length header,
+            or 0 when the header was not present.
+
+    Returns:
+        True if the file is valid, False if it is empty, truncated, or corrupt.
+    """
+    if not os.path.exists(full_filename):
+        print(f"{Color.RED}### Verification failed: file does not exist: {full_filename}{Color.END}")
+        return False
+
+    actual_size = os.path.getsize(full_filename)
+    if actual_size == 0:
+        print(f"{Color.RED}### Verification failed: {full_filename} is empty{Color.END}")
+        return False
+
+    if expected_size > 0 and actual_size != expected_size:
+        print(
+            f"{Color.RED}### Verification failed: {full_filename} is {actual_size} bytes, "
+            f"expected {expected_size} bytes{Color.END}"
+        )
+        return False
+
+    extension = os.path.splitext(full_filename)[1].lstrip(".").lower()
+    if extension not in MEDIA_EXTENSIONS:
+        return True
+
+    ffmpeg = shutil.which("ffmpeg")
+    if ffmpeg is None:
+        print(f"{Color.YELLOW}    > ffmpeg not found; skipping corruption check for {full_filename}{Color.END}")
+        return True
+
+    try:
+        result = subprocess.run(
+            [ffmpeg, "-v", "error", "-i", full_filename, "-f", "null", "-"],
+            capture_output=True,
+            timeout=600,
+        )
+    except subprocess.TimeoutExpired:
+        print(f"{Color.RED}### Verification failed: ffmpeg timed out for {full_filename}{Color.END}")
+        return False
+    except Exception as e:
+        print(f"{Color.RED}### Verification failed: ffmpeg error for {full_filename}: {e}{Color.END}")
+        return False
+
+    if result.returncode != 0:
+        print(f"{Color.RED}### Verification failed: {full_filename} appears corrupt{Color.END}")
+        return False
+
+    return True
+
+
 def download_recording(download_url, email, filename, folder_name):
     dl_dir = os.sep.join([DOWNLOAD_DIRECTORY, folder_name])
     sanitized_download_dir = path_validate.sanitize_filepath(dl_dir)
@@ -317,6 +397,20 @@ def download_recording(download_url, email, filename, folder_name):
 
     # total size in bytes.
     total_size = int(response.headers.get("content-length", 0))
+
+    if os.path.exists(full_filename):
+        local_size = os.path.getsize(full_filename)
+        local_mtime = datetime.fromtimestamp(os.path.getmtime(full_filename)).strftime("%Y-%m-%d %H:%M:%S")
+        remote_size = f"{total_size} bytes" if total_size > 0 else "unknown"
+        print(f"{Color.YELLOW}    > File already exists: {sanitized_filename}{Color.END}")
+        print(f"        Existing file: {local_size} bytes, modified {local_mtime}")
+        print(f"        Remote file:   {remote_size}")
+        choice = input("        Overwrite or skip? (o/s): ").strip().lower()
+        if choice != "o":
+            print(f"    > Skipping existing file: {sanitized_filename}")
+            response.close()
+            return True
+
     block_size = 32 * 1024  # 32 Kibibytes
 
     # create TQDM progress bar
@@ -327,6 +421,19 @@ def download_recording(download_url, email, filename, folder_name):
                 prog_bar.update(len(chunk))
                 fd.write(chunk)  # write video chunk to disk
         prog_bar.close()
+
+        if VERIFY_DOWNLOADS:
+            print(f"    > Verifying {filename}...")
+            if not verify_downloaded_file(full_filename, total_size):
+                try:
+                    os.remove(full_filename)
+                except OSError:
+                    pass
+                print(
+                    f"{Color.RED}### The video recording with filename '{filename}' failed "
+                    f"verification and has been removed{Color.END}"
+                )
+                return False
 
         return True
 
@@ -356,29 +463,33 @@ def handle_graceful_shutdown(signal_received, frame):
 
     system.exit(0)
 
-def delete_meeting_recordings(meeting_id: str, recording_ids: list = None):
-    """Delete all cloud recordings for a given meeting ID.
-    
+def delete_meeting_recordings(meeting_uuid: str, recording_ids: list = None):
+    """Delete all cloud recordings for a given meeting.
+
+    Uses the meeting UUID (not the numeric meeting ID) so the delete targets
+    the exact meeting instance. This avoids Zoom resolving a shared numeric ID
+    to the latest instance of a recurring meeting, which otherwise causes 404s.
+
     If meeting-level deletion fails with permission error (code 4711),
     attempt to delete each recording file individually.
-    
+
     Args:
-        meeting_id: The Zoom meeting ID
+        meeting_uuid: The meeting UUID
         recording_ids: List of individual recording file IDs (for fallback)
-    
+
     Returns:
         True if deletion succeeded, False otherwise.
         Exits the process if permission errors persist.
     """
     if DRY_RUN:
-        print(f"{Color.CYAN}    [DRY-RUN] Would delete all cloud recordings for MeetingID {meeting_id}{Color.END}")
+        print(f"{Color.CYAN}    [DRY-RUN] Would delete all cloud recordings for MeetingID {meeting_uuid}{Color.END}")
         return True
 
-    url = f"https://api.zoom.us/v2/meetings/{meeting_id}/recordings"
+    url = f"https://api.zoom.us/v2/meetings/{quote(meeting_uuid, safe='')}/recordings"
     resp = requests.delete(url=url, headers=AUTHORIZATION_HEADER)
     
     if resp.ok:
-        print(f"{Color.GREEN}### Deleted all cloud recordings for MeetingID {meeting_id}{Color.END}")
+        print(f"{Color.GREEN}### Deleted all cloud recordings for MeetingID {meeting_uuid}{Color.END}")
         return True
     
     # Check for permission error 4711 and attempt individual deletion
@@ -386,22 +497,22 @@ def delete_meeting_recordings(meeting_id: str, recording_ids: list = None):
         error_data = resp.json()
         if error_data.get("code") == 4711 and recording_ids:
             print(f"{Color.YELLOW}### Meeting-level deletion failed (permission error), trying individual file deletion...{Color.END}")
-            return delete_individual_recordings(meeting_id, recording_ids)
+            return delete_individual_recordings(meeting_uuid, recording_ids)
     except (json.JSONDecodeError, KeyError):
         pass
     
-    print(f"{Color.RED}### Failed to delete cloud recordings for MeetingID {meeting_id}: "
+    print(f"{Color.RED}### Failed to delete cloud recordings for MeetingID {meeting_uuid}: "
           f"{resp.status_code} {resp.text}{Color.END}")
     return False
 
 
-def delete_individual_recordings(meeting_id: str, recording_ids: list):
+def delete_individual_recordings(meeting_uuid: str, recording_ids: list):
     """Delete recording files individually.
-    
+
     Args:
-        meeting_id: The Zoom meeting ID
+        meeting_uuid: The meeting UUID
         recording_ids: List of individual recording file IDs
-    
+
     Returns:
         True if all deletions succeeded, False otherwise.
         Exits the process if permission errors persist.
@@ -413,7 +524,7 @@ def delete_individual_recordings(meeting_id: str, recording_ids: list):
             print(f"{Color.CYAN}    [DRY-RUN] Would delete recording {rec_id}{Color.END}")
             continue
         
-        url = f"https://api.zoom.us/v2/meetings/{meeting_id}/recordings/{rec_id}"
+        url = f"https://api.zoom.us/v2/meetings/{quote(meeting_uuid, safe='')}/recordings/{quote(rec_id, safe='')}"
         resp = requests.delete(url=url, headers=AUTHORIZATION_HEADER)
         
         if resp.ok:
@@ -441,6 +552,61 @@ def log(message):
     with open(COMPLETED_MEETING_IDS_LOG, 'a') as log_file:
         log_file.write(message)
         log_file.flush()
+
+
+def choose_storage_method():
+    """Prompt the user to choose a storage method.
+
+    Returns True if Google Drive is selected, False for Local Storage.
+
+    If a download_dir is defined in the config, ask whether to use the
+    configured path (Local Storage) before falling back to the standard
+    local vs Google Drive prompt.
+    """
+    configured_download_dir = CONF.get("Storage", {}).get("download_dir")
+    if configured_download_dir:
+        choice = input(f"Use path provided in config ({configured_download_dir})? (y/n): ")
+        if choice.lower() == "y":
+            print("Storage method: Local Storage (using configured path)")
+            return False
+
+    print("\nChoose download method:")
+    print("1. Local Storage")
+    print("2. Google Drive")
+    choice = input("Enter choice (1-2): ")
+    return choice == "2"
+
+
+def verify_storage_writable():
+    """Pre-flight check that the download directory is writable.
+
+    Creates the download directory (and any missing parents) and verifies a
+    file can actually be written to it, so permission problems fail fast with
+    a clear message instead of erroring on every download attempt.
+    """
+    if DRY_RUN:
+        return
+
+    try:
+        os.makedirs(DOWNLOAD_DIRECTORY, exist_ok=True)
+    except OSError as e:
+        print(f"{Color.RED}### Storage pre-flight check failed{Color.END}")
+        print(f"{Color.RED}### Download directory is not accessible: {DOWNLOAD_DIRECTORY}{Color.END}")
+        print(f"{Color.RED}### {e}{Color.END}")
+        print(f"{Color.RED}### Exiting. Fix download_dir in {CONF_PATH} or check the mount.{Color.END}")
+        system.exit(1)
+
+    test_file = os.path.join(DOWNLOAD_DIRECTORY, ".zrd-write-test")
+    try:
+        with open(test_file, "w") as fd:
+            fd.write("ok")
+        os.remove(test_file)
+    except OSError as e:
+        print(f"{Color.RED}### Storage pre-flight check failed{Color.END}")
+        print(f"{Color.RED}### Download directory is not writable: {DOWNLOAD_DIRECTORY}{Color.END}")
+        print(f"{Color.RED}### {e}{Color.END}")
+        print(f"{Color.RED}### Exiting. Fix download_dir in {CONF_PATH} or check permissions.{Color.END}")
+        system.exit(1)
 
 
 # ################################################################
@@ -485,6 +651,9 @@ def main():
     if DRY_RUN:
         print(f"{Color.CYAN}### DRY-RUN MODE ENABLED - No files will be downloaded or deleted{Color.END}\n")
 
+    if ARGS.skip_delete:
+        print(f"{Color.YELLOW}### --skip-delete: cloud recordings will NOT be deleted after download{Color.END}\n")
+
     if STORAGE_METHOD == "local":
         print(f"Storage method: Local Storage (from config)")
         GDRIVE_ENABLED = False
@@ -495,15 +664,13 @@ def main():
         if not drive_service:
             GDRIVE_ENABLED = False
     else:  # "prompt" or any other value
-        print("\nChoose download method:")
-        print("1. Local Storage")
-        print("2. Google Drive")
-        choice = input("Enter choice (1-2): ")
-        GDRIVE_ENABLED = (choice == "2")
+        GDRIVE_ENABLED = choose_storage_method()
         if GDRIVE_ENABLED:
             drive_service = setup_google_drive()
             if not drive_service:
                 GDRIVE_ENABLED = False
+
+    verify_storage_writable()
 
     load_access_token()
     load_completed_meeting_ids()
@@ -525,6 +692,7 @@ def main():
         for index, recording in enumerate(recordings):
             try:
                 recording_id = recording["uuid"]
+                meeting_uuid = recording["uuid"]
                 meeting_id = recording["id"]
                 topic = recording["topic"]
                 start_time = recording["start_time"]
@@ -598,7 +766,7 @@ def main():
 
             # Delete meeting recordings only after all files downloaded successfully
             if DELETE_AFTER_DOWNLOAD and all_downloads_successful:
-                if delete_meeting_recordings(meeting_id, downloaded_recording_ids):
+                if delete_meeting_recordings(meeting_uuid, downloaded_recording_ids):
                     log(f"** >> Deleted all recordings for MeetingID {meeting_id} - {start_time} - {topic} - {duration} from Zoom cloud\n")
             elif DELETE_AFTER_DOWNLOAD and not all_downloads_successful:
                 print(f"{Color.YELLOW}### Skipping deletion for MeetingID {meeting_id} - not all files downloaded successfully{Color.END}")

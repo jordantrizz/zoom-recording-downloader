@@ -55,7 +55,7 @@ In your app's _Scopes_ tab, add the following scopes:
 ## 3. Add Delete Scopes
 If you want to delete the downloaded recordings from Zoom's cloud, add the following scopes:
 
-   > `cloud_recording:delete:recording_file, cloud_recording:delete:recording_file:admin`
+   > `cloud_recording:delete:meeting_recording`, `cloud_recording:delete:meeting_recording:admin`
 
 ## 4. Create configuration file
 Copy **zoom-recording-downloader.conf.template** to a new file named *zoom-recording-downloader.conf** and fill in your Server-to-Server OAuth app credentials:
@@ -78,6 +78,16 @@ Copy **zoom-recording-downloader.conf.template** to a new file named *zoom-recor
               "Storage": {
                       "download_dir": "downloads",
                       "completed_log": "completed-downloads.log"
+              }
+      }
+```
+
+- After a file is downloaded, it is verified to have content (non-zero size that matches the expected `content-length`) and, for media files, to decode cleanly with ffmpeg. Set **verify_downloads** to `false` to skip this check (default is `true`). If ffmpeg is not installed, the size check still runs and the ffmpeg corruption check is skipped with a warning.
+
+```
+      {
+              "Storage": {
+                      "verify_downloads": true
               }
       }
 ```
@@ -148,6 +158,23 @@ The following placeholders are available for the **filename** and **folder** for
   - **{rec_type}** is the type of the recording
   - **{topic}** is the title of the zoom meeting
 
+# Command-line Options
+
+The script accepts the following command-line options:
+
+```
+$ zoom-recording-downloader.sh -h
+$ zoom-recording-downloader.sh --help
+```
+
+Both print the available options and exit.
+
+- **--skip-delete** keeps recordings in the Zoom cloud after download, overriding `delete_after_download: true` in the config.
+
+```
+$ zoom-recording-downloader.sh --skip-delete
+```
+
 # Google Drive Setup (Optional)
 
 To enable Google Drive upload support:
@@ -199,5 +226,9 @@ Note: When you first run the script with Google Drive enabled, it will open your
 When prompted, choose your preferred storage method:
 1. Local Storage - Saves recordings to your local machine
 2. Google Drive - Uploads recordings to your Google Drive account
+
+Note: If a **download_dir** is defined in your config, the app will instead ask `Use path provided in config (...)? (y/n)`. Answering `y` uses Local Storage with that configured path; answering `n` shows the storage method prompt above.
+
+On startup, the app verifies the download directory is writable (creating it if needed) and exits with a clear error before making any API calls if the path is not accessible.
 
 Note: For Google Drive uploads, files are temporarily downloaded to local storage before being uploaded, then automatically deleted after successful upload.

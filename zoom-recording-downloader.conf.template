@@ -11,7 +11,9 @@
         "completed_log": "completed-downloads.log",
         "verbose_url": false,
         "download_dir": "downloads",
-        "delete_after_download": false
+        "delete_after_download": false,
+        "_comment_delete": "Requires Zoom app scope cloud_recording:delete:meeting_recording (or :admin) in addition to read/download scopes",
+        "verify_downloads": true
     },
     "GoogleDrive": {
         "_comment": "Optional: Only needed if using Google Drive upload feature",
